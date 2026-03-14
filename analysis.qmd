@@ -1,0 +1,787 @@
+---
+title: "Online Retail Sales Analysis"
+subtitle: "Revenue Trends, Product Performance, Sales Velocity & Demand Forecasting"
+author: "Shawn | Lailara LLC"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    toc-location: left
+    theme: flatly
+    highlight-style: github
+    code-fold: true
+    code-summary: "Show code"
+    self-contained: true
+    fig-width: 10
+    fig-height: 5
+    df-print: kable
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 10
+    fig-height: 5
+    geometry: margin=1in
+    colorlinks: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(kableExtra)
+library(forecast)
+library(ggrepel)
+library(patchwork)
+
+# ── Theme ────────────────────────────────────────────────────────────────────
+retail_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14, color = "#1F3864"),
+    plot.subtitle    = element_text(size = 11, color = "#555555"),
+    plot.caption     = element_text(size = 8, color = "#888888", hjust = 0),
+    axis.title       = element_text(size = 10, color = "#333333"),
+    axis.text        = element_text(size = 9,  color = "#444444"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#EEEEEE"),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 9),
+    strip.text       = element_text(face = "bold", size = 10)
+  )
+
+theme_set(retail_theme)
+
+PALETTE  <- c("#1F3864","#2E86AB","#A23B72","#F18F01","#C73E1D","#3B1F2B","#44BBA4")
+NAVY     <- "#1F3864"
+TEAL     <- "#44BBA4"
+ORANGE   <- "#F18F01"
+RED      <- "#C73E1D"
+```
+
+---
+
+## 1 · Data Overview
+
+```{r load-data}
+# ── Load ─────────────────────────────────────────────────────────────────────
+# Supports both .xlsx (original UCI file) and .csv (sample/testing)
+data_xlsx <- here::here("data", "online_retail.xlsx")
+data_csv  <- here::here("data", "online_retail.csv")
+
+if (file.exists(data_xlsx)) {
+  raw <- readxl::read_excel(data_xlsx)
+} else if (file.exists(data_csv)) {
+  raw <- read_csv(data_csv, show_col_types = FALSE)
+} else {
+  stop("No data file found. See README for download instructions.")
+}
+
+# ── Clean ─────────────────────────────────────────────────────────────────────
+retail <- raw |>
+  rename_with(tolower) |>
+  rename(
+    invoice_no   = invoiceno,
+    stock_code   = stockcode,
+    description  = description,
+    quantity     = quantity,
+    invoice_date = invoicedate,
+    unit_price   = unitprice,
+    customer_id  = customerid,
+    country      = country
+  ) |>
+  mutate(
+    invoice_date = as_datetime(invoice_date),
+    date         = as_date(invoice_date),
+    year         = year(invoice_date),
+    month        = month(invoice_date, label = TRUE, abbr = TRUE),
+    week         = floor_date(date, "week"),
+    month_floor  = floor_date(date, "month"),
+    is_cancel    = str_starts(invoice_no, "C"),
+    revenue      = quantity * unit_price
+  )
+
+# ── Summaries for callouts ────────────────────────────────────────────────────
+n_raw        <- nrow(retail)
+n_cancel     <- sum(retail$is_cancel)
+n_missing_cust <- sum(is.na(retail$customer_id))
+date_min     <- min(retail$date)
+date_max     <- max(retail$date)
+
+# Remove cancellations and bad rows for analysis
+clean <- retail |>
+  filter(!is_cancel, quantity > 0, unit_price > 0)
+
+n_clean      <- nrow(clean)
+n_products   <- n_distinct(clean$stock_code)
+n_customers  <- n_distinct(clean$customer_id, na.rm = TRUE)
+n_countries  <- n_distinct(clean$country)
+total_rev    <- sum(clean$revenue)
+```
+
+This dataset contains all transactions from a UK-based online gift retailer between
+**`r format(date_min, "%B %d, %Y")`** and **`r format(date_max, "%B %d, %Y")`**.
+The company's customer base is predominantly wholesale buyers.
+
+::: {.callout-note}
+## Dataset at a Glance
+- **`r comma(n_raw)`** raw transaction rows across **`r n_countries`** countries
+- **`r comma(n_cancel)`** cancellation records removed (`r percent(n_cancel/n_raw, 0.1)` of total)
+- **`r comma(n_missing_cust)`** rows with no CustomerID (`r percent(n_missing_cust/n_raw, 0.1)`)
+- **`r comma(n_clean)`** rows retained for analysis
+- **`r comma(n_products)`** distinct products · **`r comma(n_customers)`** identified customers
+- **£`r comma(total_rev, accuracy=1)`** total revenue in analysis window
+:::
+
+```{r data-quality-table}
+# Missing value summary
+tibble(
+  Field       = c("InvoiceNo","StockCode","Description","Quantity",
+                  "InvoiceDate","UnitPrice","CustomerID","Country"),
+  `Non-Null`  = map_int(raw, ~ sum(!is.na(.))),
+  `Null Count`= map_int(raw, ~ sum(is.na(.))),
+  `Null %`    = map_chr(raw, ~ percent(mean(is.na(.)), 0.1))
+) |>
+  kbl(caption = "Field-Level Completeness") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) |>
+  column_spec(4, bold = TRUE,
+              color = ifelse(
+                map_dbl(raw, ~ mean(is.na(.))) > 0.1, RED, "#333333"
+              ))
+```
+
+---
+
+## 2 · Revenue Trends
+
+```{r monthly-revenue}
+monthly_rev <- clean |>
+  group_by(month_floor) |>
+  summarise(
+    revenue    = sum(revenue),
+    n_orders   = n_distinct(invoice_no),
+    n_items    = sum(quantity),
+    .groups    = "drop"
+  )
+
+peak <- monthly_rev |> slice_max(revenue, n = 1)
+
+ggplot(monthly_rev, aes(x = month_floor, y = revenue)) +
+  geom_area(fill = NAVY, alpha = 0.12) +
+  geom_line(color = NAVY, linewidth = 1.1) +
+  geom_point(color = NAVY, size = 2.5) +
+  geom_point(data = peak, color = ORANGE, size = 4) +
+  geom_label(
+    data     = peak,
+    aes(label = paste0("Peak\n£", comma(revenue, accuracy = 1))),
+    nudge_y  = max(monthly_rev$revenue) * 0.08,
+    size     = 3, fill = "white", color = ORANGE, fontface = "bold"
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "1 month") +
+  scale_y_continuous(labels = label_pound(scale = 1e-3, suffix = "K")) +
+  labs(
+    title    = "Monthly Revenue — Dec 2010 to Dec 2011",
+    subtitle = "Strong Q4 seasonality consistent with gift retail cycle",
+    x = NULL, y = "Revenue (£K)",
+    caption  = "Source: UCI Online Retail Dataset"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r order-volume}
+p1 <- ggplot(monthly_rev, aes(x = month_floor, y = n_orders)) +
+  geom_col(fill = TEAL, alpha = 0.85) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Monthly Order Count", x = NULL, y = "Orders") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(monthly_rev, aes(x = month_floor, y = revenue / n_orders)) +
+  geom_line(color = ORANGE, linewidth = 1) +
+  geom_point(color = ORANGE, size = 2) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(labels = label_pound()) +
+  labs(title = "Average Order Value", x = NULL, y = "AOV (£)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p1 + p2 +
+  plot_annotation(
+    title   = "Order Volume vs. Average Order Value",
+    caption = "Source: UCI Online Retail Dataset"
+  )
+```
+
+Order volume and average order value both peak in **November**, reflecting the pre-Christmas
+wholesale buying cycle. The drop in December likely reflects fulfilled orders rather than
+reduced demand.
+
+---
+
+## 3 · Top Products
+
+```{r top-products-rev}
+top_rev <- clean |>
+  group_by(stock_code, description) |>
+  summarise(
+    revenue  = sum(revenue),
+    quantity = sum(quantity),
+    .groups  = "drop"
+  ) |>
+  slice_max(revenue, n = 15) |>
+  mutate(description = str_to_title(str_trunc(description, 35)))
+
+ggplot(top_rev, aes(x = revenue,
+                    y = reorder(description, revenue))) +
+  geom_segment(aes(xend = 0, yend = reorder(description, revenue)),
+               color = "#CCCCCC", linewidth = 0.8) +
+  geom_point(aes(size = quantity), color = NAVY, alpha = 0.85) +
+  scale_x_continuous(labels = label_pound(scale = 1e-3, suffix = "K")) +
+  scale_size_continuous(labels = comma, range = c(3, 10), name = "Units Sold") +
+  labs(
+    title    = "Top 15 Products by Revenue",
+    subtitle = "Point size proportional to unit volume",
+    x = "Total Revenue (£K)", y = NULL,
+    caption  = "Source: UCI Online Retail Dataset"
+  )
+```
+
+```{r top-products-vol}
+top_vol <- clean |>
+  group_by(stock_code, description) |>
+  summarise(
+    quantity = sum(quantity),
+    revenue  = sum(revenue),
+    .groups  = "drop"
+  ) |>
+  slice_max(quantity, n = 15) |>
+  mutate(description = str_to_title(str_trunc(description, 35)))
+
+ggplot(top_vol, aes(x = quantity,
+                    y = reorder(description, quantity))) +
+  geom_col(aes(fill = revenue), alpha = 0.9) +
+  scale_x_continuous(labels = comma) +
+  scale_fill_gradient(low = "#AEC6E8", high = NAVY,
+                      labels = label_pound(scale = 1e-3, suffix = "K"),
+                      name = "Revenue (£K)") +
+  labs(
+    title    = "Top 15 Products by Unit Volume",
+    subtitle = "Fill color shows revenue — high volume ≠ high revenue",
+    x = "Total Units Sold", y = NULL,
+    caption  = "Source: UCI Online Retail Dataset"
+  )
+```
+
+The revenue and volume rankings diverge meaningfully — high-unit products are often
+low-price consumables while top-revenue products tend to be higher-value decorative items.
+This split is worth watching in the velocity section below.
+
+---
+
+## 4 · Geographic Distribution
+
+```{r geo-revenue}
+geo <- clean |>
+  group_by(country) |>
+  summarise(
+    revenue    = sum(revenue),
+    n_orders   = n_distinct(invoice_no),
+    n_customers= n_distinct(customer_id, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    uk_flag = country == "United Kingdom",
+    rev_share = revenue / sum(revenue)
+  ) |>
+  arrange(desc(revenue))
+
+# Ex-UK breakdown
+non_uk <- geo |>
+  filter(!uk_flag) |>
+  slice_max(revenue, n = 12)
+
+p_uk <- ggplot(geo |> mutate(label = if_else(uk_flag, "UK", "International")),
+               aes(x = "", y = revenue, fill = label)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar("y") +
+  scale_fill_manual(values = c("UK" = NAVY, "International" = TEAL)) +
+  labs(title = "UK vs. International Revenue", fill = NULL) +
+  theme_void(base_size = 11) +
+  theme(
+    plot.title   = element_text(face = "bold", hjust = 0.5, color = NAVY),
+    legend.position = "bottom"
+  ) +
+  geom_text(
+    aes(label = percent(rev_share, 1)),
+    position = position_stack(vjust = 0.5),
+    color = "white", fontface = "bold", size = 4
+  )
+
+p_intl <- ggplot(non_uk, aes(x = revenue,
+                              y = reorder(country, revenue))) +
+  geom_col(fill = TEAL, alpha = 0.85) +
+  scale_x_continuous(labels = label_pound(scale = 1e-3, suffix = "K")) +
+  labs(title = "Top International Markets (ex-UK)",
+       x = "Revenue (£K)", y = NULL)
+
+p_uk + p_intl +
+  plot_annotation(
+    title   = "Geographic Revenue Distribution",
+    caption = "Source: UCI Online Retail Dataset"
+  )
+```
+
+```{r geo-table}
+geo |>
+  slice_max(revenue, n = 10) |>
+  mutate(
+    revenue   = label_pound()(revenue),
+    rev_share = percent(rev_share, 0.1),
+    n_orders  = comma(n_orders)
+  ) |>
+  select(Country = country, Revenue = revenue,
+         `Share` = rev_share, Orders = n_orders,
+         Customers = n_customers) |>
+  kbl(caption = "Top 10 Markets by Revenue") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+---
+
+## 5 · Customer Behavior
+
+```{r customer-behavior}
+cust <- clean |>
+  filter(!is.na(customer_id)) |>
+  group_by(customer_id) |>
+  summarise(
+    n_orders  = n_distinct(invoice_no),
+    revenue   = sum(revenue),
+    avg_order = revenue / n_orders,
+    first_purchase = min(date),
+    last_purchase  = max(date),
+    .groups   = "drop"
+  ) |>
+  mutate(
+    segment = case_when(
+      n_orders == 1              ~ "One-Time",
+      n_orders <= 3              ~ "Occasional (2–3)",
+      n_orders <= 10             ~ "Regular (4–10)",
+      TRUE                       ~ "Frequent (11+)"
+    ),
+    segment = factor(segment, levels = c("One-Time","Occasional (2–3)",
+                                         "Regular (4–10)","Frequent (11+)"))
+  )
+
+p_seg <- cust |>
+  count(segment) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(x = segment, y = n, fill = segment)) +
+  geom_col(alpha = 0.88, show.legend = FALSE) +
+  geom_text(aes(label = paste0(comma(n), "\n", percent(pct, 1))),
+            vjust = -0.3, size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = c(PALETTE[1], PALETTE[2], PALETTE[7], PALETTE[4])) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Customer Purchase Frequency Segments",
+       x = NULL, y = "Customer Count")
+
+p_aov <- ggplot(cust, aes(x = segment, y = avg_order, fill = segment)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0.2,
+               outlier.size = 1, show.legend = FALSE) +
+  scale_fill_manual(values = c(PALETTE[1], PALETTE[2], PALETTE[7], PALETTE[4])) +
+  scale_y_continuous(labels = label_pound(), limits = c(0, quantile(cust$avg_order, 0.97))) +
+  labs(title = "Average Order Value by Segment",
+       x = NULL, y = "Avg Order Value (£)")
+
+p_seg + p_aov +
+  plot_annotation(
+    title   = "Customer Segmentation Overview",
+    caption = "Source: UCI Online Retail Dataset · Outliers above 97th percentile trimmed for readability"
+  )
+```
+
+Frequent buyers (11+ orders) represent a small share of the customer base but drive
+disproportionate revenue. The AOV spread within segments reflects the wholesale nature
+of the business — a single "Occasional" buyer may be placing very large orders.
+
+---
+
+## 6 · Sales Velocity — Top 20 Products
+
+Sales velocity measures the rate of change in unit sales across three time horizons.
+Positive velocity means a product is gaining momentum; negative means it is declining.
+
+```{r velocity-prep}
+# ── Focus on top 20 by total revenue ─────────────────────────────────────────
+top20_codes <- clean |>
+  group_by(stock_code, description) |>
+  summarise(revenue = sum(revenue), .groups = "drop") |>
+  slice_max(revenue, n = 20) |>
+  pull(stock_code)
+
+# Weekly and monthly aggregates for top 20
+vel_weekly <- clean |>
+  filter(stock_code %in% top20_codes) |>
+  mutate(description = str_to_title(str_trunc(description, 30))) |>
+  group_by(stock_code, description, week) |>
+  summarise(units = sum(quantity), .groups = "drop")
+
+vel_monthly <- clean |>
+  filter(stock_code %in% top20_codes) |>
+  mutate(description = str_to_title(str_trunc(description, 30))) |>
+  group_by(stock_code, description, month_floor) |>
+  summarise(units = sum(quantity), revenue = sum(revenue), .groups = "drop")
+
+# ── WoW, MoM, YoY for the most recent available period ───────────────────────
+last_week    <- max(vel_weekly$week)
+prev_week    <- last_week - weeks(1)
+last_month   <- max(vel_monthly$month_floor)
+prev_month   <- last_month %m-% months(1)
+prev_year_m  <- last_month %m-% months(12)
+
+velocity_summary <- vel_weekly |>
+  filter(week %in% c(last_week, prev_week)) |>
+  pivot_wider(names_from = week, values_from = units,
+              values_fill = 0, names_prefix = "w_") |>
+  rename(units_this_week = 3, units_prev_week = 4) |>
+  mutate(wow = (units_this_week - units_prev_week) /
+                 (units_prev_week + 1)) |>
+  left_join(
+    vel_monthly |>
+      filter(month_floor %in% c(last_month, prev_month)) |>
+      pivot_wider(names_from = month_floor, values_from = units,
+                  values_fill = 0, names_prefix = "m_") |>
+      rename(units_this_month = 3, units_prev_month = 4) |>
+      mutate(mom = (units_this_month - units_prev_month) /
+                     (units_prev_month + 1)) |>
+      select(stock_code, mom, units_this_month, units_prev_month),
+    by = "stock_code"
+  ) |>
+  left_join(
+    vel_monthly |>
+      filter(month_floor %in% c(last_month, prev_year_m)) |>
+      pivot_wider(names_from = month_floor, values_from = units,
+                  values_fill = 0, names_prefix = "y_") |>
+      rename(units_this_year = 3, units_prev_year = 4) |>
+      mutate(yoy = (units_this_year - units_prev_year) /
+                     (units_prev_year + 1)) |>
+      select(stock_code, yoy),
+    by = "stock_code"
+  ) |>
+  mutate(across(c(wow, mom, yoy), ~ replace_na(., 0)))
+```
+
+```{r velocity-chart}
+# ── Heatmap-style velocity table ──────────────────────────────────────────────
+vel_long <- velocity_summary |>
+  select(description, wow, mom, yoy) |>
+  pivot_longer(cols = c(wow, mom, yoy),
+               names_to = "period",
+               values_to = "change") |>
+  mutate(
+    period = factor(period,
+                    levels = c("wow","mom","yoy"),
+                    labels = c("Week over Week","Month over Month","Year over Year")),
+    change_capped = pmax(pmin(change, 2), -2)
+  )
+
+ggplot(vel_long, aes(x = period,
+                     y = reorder(description, change[period == "Month over Month"]),
+                     fill = change_capped)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = if_else(abs(change) > 5,
+                        paste0(ifelse(change > 0, "+", ""), round(change * 100), "%"),
+                        paste0(ifelse(change > 0, "+", ""), round(change * 100), "%"))),
+    size = 2.8, fontface = "bold",
+    color = if_else(abs(vel_long$change_capped) > 1.2, "white", "#333333")
+  ) +
+  scale_fill_gradient2(
+    low      = RED,
+    mid      = "white",
+    high     = TEAL,
+    midpoint = 0,
+    limits   = c(-2, 2),
+    labels   = percent,
+    name     = "% Change\n(capped ±200%)"
+  ) +
+  labs(
+    title    = "Sales Velocity Heatmap — Top 20 Products",
+    subtitle = paste0("Most recent periods: WoW ending ",
+                      format(last_week, "%b %d"),
+                      " · MoM ending ", format(last_month, "%b %Y"),
+                      " · YoY ending ", format(last_month, "%b %Y")),
+    x = NULL, y = NULL,
+    caption = "Green = gaining momentum · Red = declining · Values are % change vs. prior period"
+  ) +
+  theme(axis.text.x = element_text(face = "bold"))
+```
+
+```{r velocity-table}
+velocity_summary |>
+  mutate(
+    wow_arrow = case_when(wow >  0.05 ~ "▲", wow < -0.05 ~ "▼", TRUE ~ "→"),
+    mom_arrow = case_when(mom >  0.05 ~ "▲", mom < -0.05 ~ "▼", TRUE ~ "→"),
+    yoy_arrow = case_when(yoy >  0.05 ~ "▲", yoy < -0.05 ~ "▼", TRUE ~ "→"),
+    WoW = paste0(wow_arrow, " ", ifelse(wow >= 0, "+", ""), percent(wow, 1)),
+    MoM = paste0(mom_arrow, " ", ifelse(mom >= 0, "+", ""), percent(mom, 1)),
+    YoY = paste0(yoy_arrow, " ", ifelse(yoy >= 0, "+", ""), percent(yoy, 1))
+  ) |>
+  select(Product = description,
+         `This Week` = units_this_week,
+         `Prev Week` = units_prev_week,
+         WoW, MoM, YoY) |>
+  arrange(desc(`This Week`)) |>
+  kbl(caption = "Sales Velocity Summary — Top 20 Products") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE) |>
+  column_spec(4, color = if_else(
+    str_starts(velocity_summary |> arrange(desc(units_this_week)) |> pull(wow) |>
+                 (\(x) ifelse(x >= 0, "+", "-"))(), "\\+"), TEAL, RED)) |>
+  column_spec(5, color = if_else(
+    str_starts(velocity_summary |> arrange(desc(units_this_week)) |> pull(mom) |>
+                 (\(x) ifelse(x >= 0, "+", "-"))(), "\\+"), TEAL, RED))
+```
+
+---
+
+## 7 · Predictive Demand Forecasting
+
+Two approaches are presented: a **rolling average forecast** for operational use,
+and an **exponential smoothing model** for technical validation.
+
+### 7a · Manager View — 4-Week Rolling Forecast
+
+The rolling forecast uses each product's recent sales rate to project the next
+four weeks. This is the number a purchasing manager should use for weekly order planning.
+
+```{r rolling-forecast}
+# ── 4-week rolling average → 4-week forward projection ───────────────────────
+rolling_forecast <- vel_weekly |>
+  arrange(stock_code, week) |>
+  group_by(stock_code, description) |>
+  slice_tail(n = 8) |>                      # last 8 weeks of actuals
+  summarise(
+    avg_weekly_units  = mean(units),
+    sd_weekly_units   = sd(units),
+    last_4wk_units    = sum(tail(units, 4)),
+    prev_4wk_units    = sum(head(tail(units, 8), 4)),
+    .groups           = "drop"
+  ) |>
+  mutate(
+    proj_4wk_units    = round(avg_weekly_units * 4),
+    proj_low          = round(pmax(0, (avg_weekly_units - sd_weekly_units) * 4)),
+    proj_high         = round((avg_weekly_units + sd_weekly_units) * 4),
+    momentum          = (last_4wk_units - prev_4wk_units) / (prev_4wk_units + 1),
+    order_signal      = case_when(
+      momentum >  0.15 ~ "📈 Increase order",
+      momentum < -0.15 ~ "📉 Reduce order",
+      TRUE             ~ "➡ Maintain order"
+    )
+  ) |>
+  arrange(desc(proj_4wk_units))
+
+rolling_forecast |>
+  mutate(
+    avg_weekly_units = round(avg_weekly_units, 1),
+    proj_range       = paste0(proj_low, " – ", proj_high),
+    momentum         = percent(momentum, 1)
+  ) |>
+  select(
+    Product          = description,
+    `Avg Wkly Units` = avg_weekly_units,
+    `Proj 4-Wk Units`= proj_4wk_units,
+    `Range (±1 SD)`  = proj_range,
+    `4wk Momentum`   = momentum,
+    `Order Signal`   = order_signal
+  ) |>
+  kbl(caption = paste0("4-Week Demand Projection — Generated ",
+                       format(Sys.Date(), "%B %d, %Y"))) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE) |>
+  column_spec(6, bold = TRUE)
+```
+
+::: {.callout-tip}
+## How to use this table
+- **Proj 4-Wk Units** — the expected demand volume for the next four weeks at current run rate
+- **Range** — one standard deviation above and below the projection; order to the high end if storage permits
+- **Order Signal** — based on whether the last 4 weeks ran above or below the prior 4 weeks
+:::
+
+### 7b · Model View — Exponential Smoothing Forecast
+
+For the top 6 products by revenue, an ETS (Error, Trend, Seasonal) model is fitted to
+the weekly time series. Confidence intervals are shown at the 80% and 95% level.
+
+```{r ets-forecast, fig.height=10}
+top6_codes <- clean |>
+  group_by(stock_code, description) |>
+  summarise(revenue = sum(revenue), .groups = "drop") |>
+  slice_max(revenue, n = 6) |>
+  pull(stock_code)
+
+# Build a complete weekly grid per product (fill 0 for missing weeks)
+all_weeks <- tibble(week = seq(
+  floor_date(min(clean$date), "week"),
+  floor_date(max(clean$date), "week"),
+  by = "1 week"
+))
+
+forecast_plots <- map(top6_codes, function(code) {
+  desc <- clean |>
+    filter(stock_code == code) |>
+    pull(description) |>
+    unique() |>
+    first() |>
+    str_to_title() |>
+    str_trunc(30)
+
+  prod_weekly <- vel_weekly |>
+    filter(stock_code == code) |>
+    right_join(all_weeks, by = "week") |>
+    arrange(week) |>
+    mutate(units = replace_na(units, 0))
+
+  ts_data <- ts(prod_weekly$units, frequency = 52)
+
+  fit <- tryCatch(
+    ets(ts_data, model = "ZZZ"),
+    error = function(e) ets(ts_data, model = "ANN")
+  )
+
+  fc <- forecast(fit, h = 4, level = c(80, 95))
+
+  fc_df <- tibble(
+    week   = max(prod_weekly$week) + weeks(1:4),
+    mean   = as.numeric(fc$mean),
+    lo80   = as.numeric(fc$lower[, 1]),
+    hi80   = as.numeric(fc$upper[, 1]),
+    lo95   = as.numeric(fc$lower[, 2]),
+    hi95   = as.numeric(fc$upper[, 2])
+  ) |>
+    mutate(across(c(mean, lo80, hi80, lo95, hi95), ~ pmax(., 0)))
+
+  # Last 16 weeks of actuals for context
+  actuals_plot <- prod_weekly |> slice_tail(n = 16)
+
+  ggplot() +
+    geom_ribbon(data = fc_df,
+                aes(x = week, ymin = lo95, ymax = hi95),
+                fill = NAVY, alpha = 0.12) +
+    geom_ribbon(data = fc_df,
+                aes(x = week, ymin = lo80, ymax = hi80),
+                fill = NAVY, alpha = 0.22) +
+    geom_line(data = actuals_plot,
+              aes(x = week, y = units),
+              color = "#555555", linewidth = 0.9) +
+    geom_line(data = fc_df,
+              aes(x = week, y = mean),
+              color = NAVY, linewidth = 1, linetype = "dashed") +
+    geom_point(data = fc_df,
+               aes(x = week, y = mean),
+               color = NAVY, size = 2.5) +
+    labs(
+      title    = desc,
+      subtitle = paste0("ETS(", paste(fit$components[1:3], collapse=","), ")"
+                        , " · MAPE: ",
+                        round(accuracy(fit)["Training set","MAPE"], 1), "%"),
+      x = NULL, y = "Units / Week"
+    )
+})
+
+wrap_plots(forecast_plots, ncol = 2) +
+  plot_annotation(
+    title    = "ETS Demand Forecast — Top 6 Products (4-Week Horizon)",
+    subtitle = "Dashed line = point forecast · Shaded bands = 80% and 95% confidence intervals",
+    caption  = "Model: Exponential Smoothing (ETS) fitted per product · Source: UCI Online Retail Dataset"
+  )
+```
+
+```{r ets-summary-table}
+# Summary table of model fit quality
+map_dfr(top6_codes, function(code) {
+  desc <- clean |>
+    filter(stock_code == code) |>
+    pull(description) |> first() |> str_to_title() |> str_trunc(35)
+
+  prod_weekly <- vel_weekly |>
+    filter(stock_code == code) |>
+    right_join(all_weeks, by = "week") |>
+    arrange(week) |>
+    mutate(units = replace_na(units, 0))
+
+  ts_data <- ts(prod_weekly$units, frequency = 52)
+  fit  <- tryCatch(ets(ts_data, model = "ZZZ"),
+                   error = function(e) ets(ts_data, model = "ANN"))
+  fc   <- forecast(fit, h = 4)
+  acc  <- accuracy(fit)
+
+  tibble(
+    Product      = desc,
+    Model        = paste0("ETS(", paste(fit$components[1:3], collapse=","), ")"),
+    MAPE         = round(acc["Training set","MAPE"], 1),
+    `Wk1 Proj`   = round(fc$mean[1]),
+    `Wk2 Proj`   = round(fc$mean[2]),
+    `Wk3 Proj`   = round(fc$mean[3]),
+    `Wk4 Proj`   = round(fc$mean[4])
+  )
+}) |>
+  kbl(caption = "ETS Model Fit & 4-Week Forward Projections by Product") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE) |>
+  column_spec(3, bold = TRUE,
+              color = if_else(
+                map_dbl(top6_codes, function(code) {
+                  prod_weekly <- vel_weekly |> filter(stock_code == code) |>
+                    right_join(all_weeks, by = "week") |>
+                    mutate(units = replace_na(units, 0))
+                  fit <- tryCatch(
+                    ets(ts(prod_weekly$units, frequency = 52), model = "ZZZ"),
+                    error = function(e) ets(ts(prod_weekly$units, frequency = 52), "ANN"))
+                  accuracy(fit)["Training set","MAPE"]
+                }) < 20, TEAL, ORANGE))
+```
+
+::: {.callout-note}
+## Reading the MAPE column
+**MAPE** (Mean Absolute Percentage Error) measures average forecast error as a percentage of actuals.
+Under 20% is generally acceptable for weekly retail demand. Higher values indicate
+products with irregular or highly seasonal demand patterns where simple ETS models
+have limited predictive power.
+:::
+
+---
+
+## 8 · Key Takeaways
+
+```{r takeaways}
+top_prod_name <- top_rev |> slice_max(revenue, n = 1) |> pull(description)
+top_country   <- geo |> filter(!uk_flag) |> slice_max(revenue, n = 1) |> pull(country)
+pct_one_time  <- cust |> summarise(p = mean(segment == "One-Time")) |> pull(p)
+top_signal    <- rolling_forecast |> filter(order_signal == "📈 Increase order") |>
+                   slice_max(proj_4wk_units, n = 1) |> pull(description)
+```
+
+- **Seasonality is the dominant revenue driver.** Q4 dominates; inventory and staffing should
+  be planned around a November peak.
+- **`r top_prod_name`** is the top revenue-generating product and should be treated as
+  a flagship SKU with preferential stock levels year-round.
+- **`r top_country`** is the largest international market outside the UK and merits
+  dedicated outreach and localized promotions.
+- **`r percent(pct_one_time, 1)` of identified customers bought only once.** Repeat purchase
+  conversion is the highest-leverage growth lever available to this business.
+- **`r top_signal`** is showing the strongest upward order signal and is a priority
+  restock candidate for the next purchasing cycle.
+
+---
+
+*Analysis produced with R `r R.version$major`.`r R.version$minor` ·
+ggplot2 · forecast · Quarto · Data: UCI Online Retail Dataset (CC BY 4.0)*

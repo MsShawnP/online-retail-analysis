@@ -1,0 +1,31 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/staging/
+
+# Quarto output
+analysis.html
+analysis.pdf
+*_files/
+*_cache/
+.quarto/
+
+# Data — download separately per README
+data/*.xlsx
+data/*.xls
+data/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+*.swp
